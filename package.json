@@ -8,7 +8,8 @@
     "dev": "nodemon server.js",
     "db:schema": "node scripts/run-sql.js sql/schema.sql",
     "db:seed": "node scripts/run-sql.js sql/seed.sql",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "db:reset": "node scripts/run-sql.js sql/reset.sql"
   },
   "engines": {
     "node": ">=20"
