@@ -375,7 +375,102 @@ const riderEarnings = async (riderId, period) => {
   return rows[0];
 };
 
+/**
+ * Everything the cook's dashboard shows for one window of time.
+ *
+ * `from`/`to` are inclusive dates. Sales count delivered orders only — an
+ * order that was never delivered is not money — while the rejection figures
+ * deliberately look at every order placed, since that is what a rejection
+ * rate is a rate *of*.
+ */
+const cookInsights = async (cookId, commissionPct, from, to) => {
+  const net = `ROUND(${COLUMNS.ITEM_TOTAL} * (1 - ? / 100))`;
+  const delivered = `${COLUMNS.COOK_ID} = ? AND ${COLUMNS.STATUS} = 'delivered'
+     AND DATE(${COLUMNS.DELIVERED_AT}) BETWEEN ? AND ?`;
+  const placed = `${COLUMNS.COOK_ID} = ?
+     AND DATE(${COLUMNS.PLACED_AT}) BETWEEN ? AND ?`;
+
+  const [[sales]] = await pool.query(
+    `SELECT COUNT(*) AS orders,
+            COALESCE(SUM(${COLUMNS.ITEM_TOTAL}), 0) AS gross,
+            COALESCE(SUM(${net}), 0) AS net
+       FROM ${TABLES.ORDERS} WHERE ${delivered}`,
+    [commissionPct, cookId, from, to]
+  );
+
+  const [daily] = await pool.query(
+    `SELECT DATE(${COLUMNS.DELIVERED_AT}) AS day, COUNT(*) AS orders,
+            COALESCE(SUM(${COLUMNS.ITEM_TOTAL}), 0) AS gross,
+            COALESCE(SUM(${net}), 0) AS net
+       FROM ${TABLES.ORDERS} WHERE ${delivered}
+      GROUP BY day ORDER BY day ASC`,
+    [commissionPct, cookId, from, to]
+  );
+
+  const [hourly] = await pool.query(
+    `SELECT HOUR(${COLUMNS.PLACED_AT}) AS hour, COUNT(*) AS orders,
+            COALESCE(SUM(${COLUMNS.ITEM_TOTAL}), 0) AS gross
+       FROM ${TABLES.ORDERS} WHERE ${delivered}
+      GROUP BY hour ORDER BY hour ASC`,
+    [cookId, from, to]
+  );
+
+  // Every order placed in the window, so the rate has a denominator.
+  const [[volume]] = await pool.query(
+    `SELECT COUNT(*) AS placed,
+            COALESCE(SUM(${COLUMNS.STATUS} = 'cancelled'), 0) AS cancelled,
+            COALESCE(SUM(CASE WHEN ${COLUMNS.STATUS} = 'cancelled'
+                         THEN ${COLUMNS.ITEM_TOTAL} ELSE 0 END), 0) AS lost
+       FROM ${TABLES.ORDERS} WHERE ${placed}`,
+    [cookId, from, to]
+  );
+
+  const [reasons] = await pool.query(
+    `SELECT COALESCE(NULLIF(TRIM(${COLUMNS.CANCEL_REASON}), ''), 'No reason given') AS reason,
+            COUNT(*) AS count
+       FROM ${TABLES.ORDERS}
+      WHERE ${placed} AND ${COLUMNS.STATUS} = 'cancelled'
+      GROUP BY reason ORDER BY count DESC LIMIT 5`,
+    [cookId, from, to]
+  );
+
+  const [topItems] = await pool.query(
+    `SELECT oi.${ITEMS.DISH_ID} AS dish_id,
+            MAX(oi.${ITEMS.NAME}) AS name,
+            SUM(oi.${ITEMS.QUANTITY}) AS quantity,
+            SUM(oi.${ITEMS.PRICE} * oi.${ITEMS.QUANTITY}) AS revenue
+       FROM ${TABLES.ORDER_ITEMS} oi
+       JOIN ${TABLES.ORDERS} o ON o.${COLUMNS.ID} = oi.${ITEMS.ORDER_ID}
+      WHERE o.${COLUMNS.COOK_ID} = ? AND o.${COLUMNS.STATUS} = 'delivered'
+        AND DATE(o.${COLUMNS.DELIVERED_AT}) BETWEEN ? AND ?
+      GROUP BY oi.${ITEMS.DISH_ID}
+      ORDER BY revenue DESC LIMIT 5`,
+    [cookId, from, to]
+  );
+
+  // An order is "returning" when that customer had already been delivered an
+  // order by this cook before this one was placed.
+  const [[customers]] = await pool.query(
+    `SELECT COUNT(*) AS orders,
+            COUNT(DISTINCT o.${COLUMNS.CUSTOMER_ID}) AS people,
+            COALESCE(SUM(EXISTS (
+              SELECT 1 FROM ${TABLES.ORDERS} prior
+               WHERE prior.${COLUMNS.COOK_ID} = o.${COLUMNS.COOK_ID}
+                 AND prior.${COLUMNS.CUSTOMER_ID} = o.${COLUMNS.CUSTOMER_ID}
+                 AND prior.${COLUMNS.STATUS} = 'delivered'
+                 AND prior.${COLUMNS.PLACED_AT} < o.${COLUMNS.PLACED_AT}
+            )), 0) AS returning_orders
+       FROM ${TABLES.ORDERS} o
+      WHERE o.${COLUMNS.COOK_ID} = ? AND o.${COLUMNS.STATUS} = 'delivered'
+        AND DATE(o.${COLUMNS.DELIVERED_AT}) BETWEEN ? AND ?`,
+    [cookId, from, to]
+  );
+
+  return { sales, daily, hourly, volume, reasons, topItems, customers };
+};
+
 module.exports = {
+  cookInsights,
   getNextOrderNumber,
   createOrder,
   getById,

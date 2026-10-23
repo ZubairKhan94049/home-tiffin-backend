@@ -6,6 +6,16 @@ const orderModel = require("../models/orderModel");
 const settlementModel = require("../models/settlementModel");
 const settingsModel = require("../models/settingsModel");
 const notificationModel = require("../models/notificationModel");
+const cookBankAccountModel = require("../models/cookBankAccountModel");
+const cookBankRequestModel = require("../models/cookBankRequestModel");
+const BANK_REQUESTS = require("../config/tableColumns/tblcookbankrequestsColumns");
+const BANK_ACCOUNTS = require("../config/tableColumns/tblcookbankaccountsColumns");
+const COOK_PROFILES = require("../config/tableColumns/tblcookprofilesColumns");
+const { buildState } = require("./cookOnboardingController");
+const {
+  riderProfileCompletion,
+} = require("../helpers/riderCompletionHelper");
+const authHelper = require("../helpers/authHelper");
 const pool = require("../config/db");
 const TABLES = require("../config/tableNames");
 const USERS = require("../config/tableColumns/tblusersColumns");
@@ -87,15 +97,175 @@ const getCookById = async (req, res) => {
 
     const profile = await cookProfileModel.getByUserId(id);
     const dishes = await dishModel.listByCook(id);
+    const bankAccounts = await cookBankAccountModel.listByCook(id);
 
     const clean = { ...user };
     delete clean[USERS.PASSWORD];
 
-    res
-      .status(200)
-      .json({ success: true, data: { ...clean, profile, dishes } });
+    res.status(200).json({
+      success: true,
+      data: {
+        ...clean,
+        profile,
+        dishes,
+        bank_accounts: bankAccounts,
+        onboarding: buildState(user, profile),
+      },
+    });
   } catch (error) {
     console.error("Error fetching cook:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+// Helper: create a cook/rider account on the admin's behalf.
+//
+// Self-signup (POST /auth/register) lands `pending` and waits for approval.
+// Here the admin is the approving authority and has usually vetted the person
+// in an onboarding visit, so the account defaults to `active` and is stamped
+// approved. Pass status: "pending" to queue it for review instead.
+const createStaffAccount = async ({ role, body, buildProfile, res }) => {
+  const { name, phone, email, password, status } = body;
+
+  if (!name || !phone || !password) {
+    return res.status(400).json({
+      success: false,
+      message: "Name, phone and password are required",
+    });
+  }
+  if (`${password}`.length < 8) {
+    return res.status(400).json({
+      success: false,
+      message: "Password must be at least 8 characters",
+    });
+  }
+
+  const missing = buildProfile.required.filter((field) => !body[field]);
+  if (missing.length) {
+    return res.status(400).json({
+      success: false,
+      message: `Missing required ${role} details: ${missing.join(", ")}`,
+    });
+  }
+
+  const existing = await userModel.findUserByPhoneOrEmail(phone, email);
+  if (existing) {
+    return res.status(400).json({
+      success: false,
+      message: "A user with this phone or email already exists",
+    });
+  }
+
+  const accountStatus = status === "pending" ? "pending" : "active";
+  const userId = await userModel.createUser({
+    name,
+    email: email || null,
+    phone,
+    password: await authHelper.hashPassword(password),
+    role,
+    status: accountStatus,
+  });
+
+  await buildProfile.create(userId);
+
+  if (accountStatus === "active") {
+    await buildProfile.model.updateByUserId(userId, {
+      approved_at: new Date(),
+      rejection_reason: null,
+    });
+    await notificationModel.createNotification({
+      user_id: Number(userId),
+      title: buildProfile.notification.title,
+      body: buildProfile.notification.body,
+      type: "account",
+    });
+  }
+
+  const user = await userModel.getUserById(userId);
+  const clean = { ...user };
+  delete clean[USERS.PASSWORD];
+
+  return res.status(201).json({
+    success: true,
+    message:
+      accountStatus === "active"
+        ? `${role === "cook" ? "Cook" : "Rider"} created and activated`
+        : `${role === "cook" ? "Cook" : "Rider"} created and queued for approval`,
+    data: clean,
+  });
+};
+
+const createCook = async (req, res) => {
+  try {
+    const { kitchen_name, city, area, bio } = req.body;
+    return await createStaffAccount({
+      role: "cook",
+      body: req.body,
+      res,
+      buildProfile: {
+        required: ["kitchen_name", "city", "area"],
+        model: cookProfileModel,
+        create: (userId) =>
+          cookProfileModel.createProfile({
+            user_id: userId,
+            kitchen_name,
+            city,
+            area,
+            bio: bio || null,
+          }),
+        notification: {
+          title: "Kitchen approved",
+          body: "Your kitchen has been set up by the Home Tiffin team. You can start receiving orders.",
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error creating cook:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+const createRider = async (req, res) => {
+  try {
+    const {
+      city,
+      vehicle_type,
+      vehicle_brand,
+      vehicle_model,
+      license_plate,
+      cnic_number,
+    } = req.body;
+    return await createStaffAccount({
+      role: "rider",
+      body: req.body,
+      res,
+      buildProfile: {
+        required: ["city", "vehicle_type", "license_plate", "cnic_number"],
+        model: riderProfileModel,
+        create: (userId) =>
+          riderProfileModel.createProfile({
+            user_id: userId,
+            city,
+            vehicle_type,
+            vehicle_brand: vehicle_brand || null,
+            vehicle_model: vehicle_model || null,
+            license_plate,
+            cnic_number,
+          }),
+        notification: {
+          title: "Rider account approved",
+          body: "Your rider account has been set up by the Home Tiffin team. Go online to start delivering.",
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error creating rider:", error);
     res.status(500).json({
       success: false,
       message: error?.sqlMessage || error?.message || "Internal server error",
@@ -262,9 +432,17 @@ const getRiderById = async (req, res) => {
     const clean = { ...user };
     delete clean[USERS.PASSWORD];
 
-    res
-      .status(200)
-      .json({ success: true, data: { ...clean, profile, settlements } });
+    res.status(200).json({
+      success: true,
+      data: {
+        ...clean,
+        profile,
+        settlements,
+        // The same gate the rider app shows them, so the admin can see why a
+        // rider still cannot go online.
+        completion: riderProfileCompletion(profile, user),
+      },
+    });
   } catch (error) {
     console.error("Error fetching rider:", error);
     res.status(500).json({
@@ -686,6 +864,14 @@ const updateSettings = async (req, res) => {
       "discount_amount",
       "service_areas",
       "support_phone",
+      // Platform deposit account — shown read-only to riders so they know
+      // where to bank the cash they collect.
+      "payout_bank_name",
+      "payout_account_title",
+      "payout_account_number",
+      "payout_iban",
+      "payout_instructions",
+      "deposit_due_day",
     ];
     const settingsData = {};
     for (const field of allowedFields) {
@@ -710,10 +896,301 @@ const updateSettings = async (req, res) => {
   }
 };
 
+// ---------------------- COOK ONBOARDING STATUS ----------------------
+// The four rows the cook sees on their status screen after submitting. The
+// admin drives each one; the cook app just renders whatever is set here.
+
+const ONBOARDING_STATUS_VALUES = {
+  contract: ["pending", "sent", "completed"],
+  documents: ["pending", "under_review", "approved", "rejected"],
+  profile: ["locked", "ready", "completed"],
+  activation: ["locked", "ready", "active"],
+};
+
+const ONBOARDING_STATUS_COLUMNS = {
+  contract: COOK_PROFILES.CONTRACT_STATUS,
+  documents: COOK_PROFILES.DOCUMENTS_STATUS,
+  profile: COOK_PROFILES.PROFILE_STATUS,
+  activation: COOK_PROFILES.ACTIVATION_STATUS,
+};
+
+const NOTIFICATIONS = {
+  contract: {
+    sent: ["Contract sent", "Your contract is on its way to your email."],
+    completed: ["Contract complete", "Thanks — your contract is signed and filed."],
+  },
+  documents: {
+    approved: ["Documents approved", "Your documents passed review."],
+    rejected: ["Documents need attention", "Please re-upload your documents."],
+  },
+  profile: {
+    ready: ["Create your profile", "You can now add your images, menu and hours."],
+  },
+  activation: {
+    active: ["You are live", "Your kitchen is activated and can receive orders."],
+  },
+};
+
+const updateCookOnboardingStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await userModel.getUserById(id);
+    if (!user || user[USERS.ROLE] !== "cook") {
+      return res.status(404).json({ success: false, message: "Cook not found" });
+    }
+
+    const reason = `${req.body.note ?? ""}`.trim();
+
+    const data = {};
+    const notes = [];
+    for (const [key, allowed] of Object.entries(ONBOARDING_STATUS_VALUES)) {
+      const value = req.body[key];
+      if (value === undefined) continue;
+      if (!allowed.includes(value)) {
+        return res.status(400).json({
+          success: false,
+          message: `${key} must be one of: ${allowed.join(", ")}`,
+        });
+      }
+      data[ONBOARDING_STATUS_COLUMNS[key]] = value;
+      const note = NOTIFICATIONS[key]?.[value];
+      if (note) {
+        // A rejection note replaces the generic body — it is the only thing
+        // that tells the cook which upload to redo.
+        notes.push(
+          key === "documents" && value === "rejected" && reason
+            ? [note[0], reason]
+            : note
+        );
+      }
+    }
+
+    // The cook's status screen reads the reason from the profile, so it is
+    // stored (and cleared again when the documents are accepted).
+    if (data[ONBOARDING_STATUS_COLUMNS.documents] === "rejected") {
+      data[COOK_PROFILES.REJECTION_REASON] = reason || null;
+    } else if (data[ONBOARDING_STATUS_COLUMNS.documents] === "approved") {
+      data[COOK_PROFILES.REJECTION_REASON] = null;
+    }
+
+    if (!Object.keys(data).length) {
+      return res.status(400).json({
+        success: false,
+        message: "Send at least one of: contract, documents, profile, activation",
+      });
+    }
+
+    await cookProfileModel.updateByUserId(id, data);
+
+    // Activating the cook also makes the account usable.
+    if (data[COOK_PROFILES.ACTIVATION_STATUS] === "active") {
+      await setStatusForRole(id, "cook", "active");
+      await cookProfileModel.updateByUserId(id, {
+        [COOK_PROFILES.APPROVED_AT]: new Date(),
+        [COOK_PROFILES.REJECTION_REASON]: null,
+      });
+    }
+
+    for (const [title, body] of notes) {
+      await notificationModel.createNotification({
+        user_id: Number(id),
+        title,
+        body,
+        type: "account",
+      });
+    }
+
+    const profile = await cookProfileModel.getByUserId(id);
+    res.status(200).json({
+      success: true,
+      message: "Onboarding status updated",
+      data: buildState(await userModel.getUserById(id), profile),
+    });
+  } catch (error) {
+    console.error("Error updating cook onboarding status:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+// ---------------------- COOK BANK REQUESTS ----------------------
+//
+// Cooks cannot change their own payout accounts; they ask and an admin
+// applies it here. Approving is what actually writes to
+// tblcookbankaccounts — until then nothing about the account has moved.
+
+const getBankRequests = async (req, res) => {
+  try {
+    const status = `${req.query.status ?? ""}`.trim();
+    const allowed = ["pending", "approved", "rejected"];
+    const requests = await cookBankRequestModel.listForAdmin(
+      allowed.includes(status) ? status : null
+    );
+    res.status(200).json({ success: true, data: requests });
+  } catch (error) {
+    console.error("Error fetching bank requests:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+const approveBankRequest = async (req, res) => {
+  try {
+    const request = await cookBankRequestModel.getById(req.params.id);
+    if (!request) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Request not found" });
+    }
+    if (request[BANK_REQUESTS.STATUS] !== "pending") {
+      return res
+        .status(400)
+        .json({ success: false, message: "That request is already decided" });
+    }
+
+    const cookId = request[BANK_REQUESTS.COOK_ID];
+    const type = request[BANK_REQUESTS.TYPE];
+    const details = {
+      bank_name: request[BANK_REQUESTS.BANK_NAME],
+      account_title: request[BANK_REQUESTS.ACCOUNT_TITLE],
+      account_number: request[BANK_REQUESTS.ACCOUNT_NUMBER],
+      iban: request[BANK_REQUESTS.IBAN],
+      branch: request[BANK_REQUESTS.BRANCH],
+      proof_image: request[BANK_REQUESTS.PROOF_IMAGE],
+    };
+    const makeDefault = Boolean(request[BANK_REQUESTS.MAKE_DEFAULT]);
+
+    if (type === "add") {
+      // The first account a cook has must receive payouts, whatever they asked.
+      const existing = await cookBankAccountModel.countForCook(cookId);
+      await cookBankAccountModel.createAccount({
+        cook_id: cookId,
+        ...details,
+        is_default: existing === 0 || makeDefault ? 1 : 0,
+      });
+    } else if (type === "update") {
+      await cookBankAccountModel.updateAccount(
+        request[BANK_REQUESTS.ACCOUNT_ID],
+        cookId,
+        {
+          [BANK_ACCOUNTS.BANK_NAME]: details.bank_name,
+          [BANK_ACCOUNTS.ACCOUNT_TITLE]: details.account_title,
+          [BANK_ACCOUNTS.ACCOUNT_NUMBER]: details.account_number,
+          [BANK_ACCOUNTS.IBAN]: details.iban,
+          [BANK_ACCOUNTS.BRANCH]: details.branch,
+          [BANK_ACCOUNTS.PROOF_IMAGE]: details.proof_image,
+        }
+      );
+      if (makeDefault) {
+        await cookBankAccountModel.setDefault(
+          cookId,
+          request[BANK_REQUESTS.ACCOUNT_ID]
+        );
+      }
+    } else {
+      const account = await cookBankAccountModel.getById(
+        request[BANK_REQUESTS.ACCOUNT_ID]
+      );
+      await cookBankAccountModel.deleteAccount(
+        request[BANK_REQUESTS.ACCOUNT_ID],
+        cookId
+      );
+      // Removing the payout account promotes another, so the cook is never
+      // left with accounts but nowhere to be paid.
+      if (account?.[BANK_ACCOUNTS.IS_DEFAULT]) {
+        const remaining = await cookBankAccountModel.listByCook(cookId);
+        if (remaining.length) {
+          await cookBankAccountModel.setDefault(
+            cookId,
+            remaining[0][BANK_ACCOUNTS.ID]
+          );
+        }
+      }
+    }
+
+    await cookBankRequestModel.updateRequest(request[BANK_REQUESTS.ID], {
+      [BANK_REQUESTS.STATUS]: "approved",
+      [BANK_REQUESTS.ADMIN_NOTE]: `${req.body.note ?? ""}`.trim() || null,
+      [BANK_REQUESTS.REVIEWED_BY]: req.user.id,
+      [BANK_REQUESTS.REVIEWED_AT]: new Date(),
+    });
+
+    await notificationModel.createNotification({
+      user_id: cookId,
+      title: "Payout account updated",
+      body: "Your request was approved and your payout details are now live.",
+      type: "account",
+    });
+
+    res.status(200).json({ success: true, message: "Request approved" });
+  } catch (error) {
+    console.error("Error approving bank request:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+const rejectBankRequest = async (req, res) => {
+  try {
+    const reason = `${req.body.reason ?? req.body.note ?? ""}`.trim();
+    if (!reason) {
+      return res.status(400).json({
+        success: false,
+        message: "Give a reason — the cook sees it in the app",
+      });
+    }
+
+    const request = await cookBankRequestModel.getById(req.params.id);
+    if (!request) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Request not found" });
+    }
+    if (request[BANK_REQUESTS.STATUS] !== "pending") {
+      return res
+        .status(400)
+        .json({ success: false, message: "That request is already decided" });
+    }
+
+    await cookBankRequestModel.updateRequest(request[BANK_REQUESTS.ID], {
+      [BANK_REQUESTS.STATUS]: "rejected",
+      [BANK_REQUESTS.ADMIN_NOTE]: reason,
+      [BANK_REQUESTS.REVIEWED_BY]: req.user.id,
+      [BANK_REQUESTS.REVIEWED_AT]: new Date(),
+    });
+
+    await notificationModel.createNotification({
+      user_id: request[BANK_REQUESTS.COOK_ID],
+      title: "Payout account request declined",
+      body: reason,
+      type: "account",
+    });
+
+    res.status(200).json({ success: true, message: "Request rejected" });
+  } catch (error) {
+    console.error("Error rejecting bank request:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
 module.exports = {
+  getBankRequests,
+  approveBankRequest,
+  rejectBankRequest,
   getDashboard,
   getCooks,
   getCookById,
+  createCook,
+  updateCookOnboardingStatus,
   approveCook,
   rejectCook,
   blockCook,
@@ -722,6 +1199,7 @@ module.exports = {
   unhideDish,
   getRiders,
   getRiderById,
+  createRider,
   approveRider,
   rejectRider,
   blockRider,

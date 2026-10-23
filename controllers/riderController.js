@@ -4,6 +4,9 @@ const settlementModel = require("../models/settlementModel");
 const notificationModel = require("../models/notificationModel");
 const ORDERS = require("../config/tableColumns/tblordersColumns");
 const RIDER_PROFILES = require("../config/tableColumns/tblriderprofilesColumns");
+const settingsModel = require("../models/settingsModel");
+const userModel = require("../models/userModel");
+const { riderProfileCompletion } = require("../helpers/riderCompletionHelper");
 
 // ---------------------- TOGGLE ONLINE STATUS ----------------------
 const toggleStatus = async (req, res) => {
@@ -16,6 +19,21 @@ const toggleStatus = async (req, res) => {
     }
 
     const newState = profile[RIDER_PROFILES.IS_ONLINE] ? 0 : 1;
+
+    // Going offline is always allowed; going online is not until the profile
+    // is complete. Enforced here so the rule holds whatever the client does.
+    if (newState === 1) {
+      const user = await userModel.getUserById(req.user.id);
+      const completion = riderProfileCompletion(profile, user);
+      if (!completion.is_complete) {
+        return res.status(403).json({
+          success: false,
+          message: `Complete your profile before going online. Still needed: ${completion.missing.join(", ")}.`,
+          data: { completion },
+        });
+      }
+    }
+
     await riderProfileModel.updateByUserId(req.user.id, {
       [RIDER_PROFILES.IS_ONLINE]: newState,
     });
@@ -67,6 +85,19 @@ const getOrders = async (req, res) => {
 const acceptOrder = async (req, res) => {
   try {
     const { id } = req.params;
+
+    // Second gate: a rider with an incomplete profile must not end up holding
+    // an order, even if they were online before a field was cleared.
+    const profile = await riderProfileModel.getByUserId(req.user.id);
+    const user = await userModel.getUserById(req.user.id);
+    const completion = riderProfileCompletion(profile, user);
+    if (!completion.is_complete) {
+      return res.status(403).json({
+        success: false,
+        message: `Complete your profile before accepting deliveries. Still needed: ${completion.missing.join(", ")}.`,
+        data: { completion },
+      });
+    }
 
     const result = await orderModel.assignRider(id, req.user.id);
     if (result.affectedRows === 0) {
@@ -206,7 +237,11 @@ const getProfile = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Rider profile not found" });
     }
-    res.status(200).json({ success: true, data: profile });
+    const user = await userModel.getUserById(req.user.id);
+    res.status(200).json({
+      success: true,
+      data: { ...profile, completion: riderProfileCompletion(profile, user) },
+    });
   } catch (error) {
     console.error("Error fetching rider profile:", error);
     res.status(500).json({
@@ -224,6 +259,15 @@ const updateProfile = async (req, res) => {
       "vehicle_brand",
       "vehicle_model",
       "license_plate",
+      "cnic_number",
+      // CNIC address + emergency contact — required before a rider may work.
+      "address_line",
+      "address_area",
+      "address_city",
+      "emergency_name",
+      "emergency_relationship",
+      "emergency_phone",
+      "emergency_alt_phone",
     ];
     const profileData = {};
     for (const field of allowedFields) {
@@ -278,7 +322,68 @@ const uploadDocuments = async (req, res) => {
   }
 };
 
+// Where the rider banks the cash they have collected. Read-only: riders never
+// supply their own account under the cash-first flow, they pay into ours.
+const getDepositAccount = async (req, res) => {
+  try {
+    const settings = await settingsModel.getSettings();
+    const profile = await riderProfileModel.getByUserId(req.user.id);
+    res.status(200).json({
+      success: true,
+      data: {
+        bank_name: settings?.payout_bank_name || null,
+        account_title: settings?.payout_account_title || null,
+        account_number: settings?.payout_account_number || null,
+        iban: settings?.payout_iban || null,
+        instructions: settings?.payout_instructions || null,
+        deposit_due_day: settings?.deposit_due_day || "Sunday",
+        support_phone: settings?.support_phone || null,
+        cash_in_hand: Number(profile?.cash_in_hand || 0),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching deposit account:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+// The rider confirms they have read the safety guidelines. Stamped once —
+// re-accepting is harmless and simply refreshes the date.
+const acceptSafetyGuidelines = async (req, res) => {
+  try {
+    const profile = await riderProfileModel.getByUserId(req.user.id);
+    if (!profile) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Rider profile not found" });
+    }
+
+    await riderProfileModel.updateByUserId(req.user.id, {
+      [RIDER_PROFILES.SAFETY_ACCEPTED_AT]: new Date(),
+    });
+
+    const updated = await riderProfileModel.getByUserId(req.user.id);
+    const user = await userModel.getUserById(req.user.id);
+    res.status(200).json({
+      success: true,
+      message: "Safety guidelines accepted",
+      data: { completion: riderProfileCompletion(updated, user) },
+    });
+  } catch (error) {
+    console.error("Error accepting safety guidelines:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
 module.exports = {
+  acceptSafetyGuidelines,
+  getDepositAccount,
   toggleStatus,
   getAvailableOrders,
   getOrders,

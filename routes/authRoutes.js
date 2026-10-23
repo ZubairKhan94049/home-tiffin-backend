@@ -20,6 +20,23 @@ router.post("/register", authController.register);
 router.post("/login", authController.login);
 
 /**
+ * @route   POST /api/v1/auth/social
+ * @desc    Sign in or sign up a customer with Google, Apple or Facebook.
+ *          Body: { provider, token, name? }. The token is verified with the
+ *          provider itself, never trusted as sent.
+ * @access  Public
+ */
+router.post("/social", authController.socialSignIn);
+
+/**
+ * @route   GET /api/v1/auth/providers
+ * @desc    Which social buttons the apps should show — a provider without
+ *          server credentials would only fail when tapped.
+ * @access  Public
+ */
+router.get("/providers", authController.getAuthProviders);
+
+/**
  * @route   GET /api/v1/auth/me
  * @desc    Current authenticated user (+role profile)
  * @access  Private

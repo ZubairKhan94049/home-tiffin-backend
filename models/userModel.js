@@ -7,20 +7,38 @@ const createUser = async (userData) => {
   const {
     [COLUMNS.NAME]: name,
     [COLUMNS.EMAIL]: email = null,
-    [COLUMNS.PHONE]: phone,
-    [COLUMNS.PASSWORD]: password,
+    // Either may be absent now: an email-only sign-up has no phone, and a
+    // social account has no password.
+    [COLUMNS.PHONE]: phone = null,
+    [COLUMNS.PASSWORD]: password = null,
     [COLUMNS.ROLE]: role = "customer",
     [COLUMNS.STATUS]: status = "active",
+    [COLUMNS.AUTH_PROVIDER]: authProvider = "password",
+    [COLUMNS.PROVIDER_USER_ID]: providerUserId = null,
   } = userData;
 
   const [result] = await pool.query(
     `INSERT INTO ${TABLES.USERS}
-      (${COLUMNS.NAME}, ${COLUMNS.EMAIL}, ${COLUMNS.PHONE}, ${COLUMNS.PASSWORD}, ${COLUMNS.ROLE}, ${COLUMNS.STATUS})
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [name, email, phone, password, role, status]
+      (${COLUMNS.NAME}, ${COLUMNS.EMAIL}, ${COLUMNS.PHONE}, ${COLUMNS.PASSWORD},
+       ${COLUMNS.ROLE}, ${COLUMNS.STATUS}, ${COLUMNS.AUTH_PROVIDER},
+       ${COLUMNS.PROVIDER_USER_ID})
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [name, email, phone || null, password, role, status, authProvider, providerUserId]
   );
 
   return result.insertId;
+};
+
+// The same person signing in again through Google, Apple or Facebook.
+const findUserByProvider = async (provider, providerUserId) => {
+  if (!provider || !providerUserId) return undefined;
+  const [rows] = await pool.query(
+    `SELECT * FROM ${TABLES.USERS}
+      WHERE ${COLUMNS.AUTH_PROVIDER} = ? AND ${COLUMNS.PROVIDER_USER_ID} = ?
+      LIMIT 1`,
+    [provider, providerUserId]
+  );
+  return rows[0];
 };
 
 // Get a single user by ID
@@ -121,6 +139,7 @@ module.exports = {
   createUser,
   getUserById,
   findUserByPhoneOrEmail,
+  findUserByProvider,
   updateUser,
   setUserStatus,
   listUsersByRole,

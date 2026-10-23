@@ -56,9 +56,11 @@ app.get("/health", (req, res) => {
 });
 
 //Routes
+app.use("/api/v1", require("./routes/publicRoutes"));
 app.use("/api/v1/auth", require("./routes/authRoutes"));
 app.use("/api/v1/cooks", require("./routes/cooksRoutes"));
 app.use("/api/v1/dishes", require("./routes/dishRoutes"));
+app.use("/api/v1/banners", require("./routes/bannerRoutes"));
 app.use("/api/v1/addresses", require("./routes/addressRoutes"));
 app.use("/api/v1/orders", require("./routes/orderRoutes"));
 app.use("/api/v1/cook", require("./routes/cookRoutes"));
