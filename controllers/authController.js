@@ -2,6 +2,7 @@ const userModel = require("../models/userModel");
 const cookProfileModel = require("../models/cookProfileModel");
 const riderProfileModel = require("../models/riderProfileModel");
 const authHelper = require("../helpers/authHelper");
+const socialAuthHelper = require("../helpers/socialAuthHelper");
 const COLUMNS = require("../config/tableColumns/tblusersColumns");
 
 // Remove sensitive fields before sending a user out
@@ -25,12 +26,22 @@ const withProfile = async (user) => {
 };
 
 // ---------------------- REGISTER ----------------------
+/// Customers sign up with one field that takes either a phone number or an
+/// email address, so `identifier` is split into whichever it is. Cooks and
+/// riders still send `phone` and `email` separately.
+const splitIdentifier = (body) => {
+  const identifier = `${body.identifier ?? ""}`.trim();
+  if (!identifier) return { phone: body.phone, email: body.email };
+  return identifier.includes("@")
+    ? { phone: body.phone ?? null, email: identifier }
+    : { phone: identifier, email: body.email ?? null };
+};
+
 const register = async (req, res) => {
   try {
+    const { phone, email } = splitIdentifier(req.body);
     const {
       name,
-      phone,
-      email,
       password,
       role,
       // cook profile fields
@@ -46,10 +57,13 @@ const register = async (req, res) => {
       cnic_number,
     } = req.body;
 
-    if (!name || !phone || !password) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Name, phone and password are required" });
+    // A customer may have signed up with an email instead, so one of the two
+    // is enough — but never neither, or there is no way to sign back in.
+    if (!name || !password || (!phone && !email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, password and a phone number or email are required",
+      });
     }
 
     const allowedRoles = ["customer", "cook", "rider"];
@@ -60,7 +74,12 @@ const register = async (req, res) => {
         .json({ success: false, message: "Role must be customer, cook or rider" });
     }
 
-    if (userRole === "cook" && (!kitchen_name || !city || !area)) {
+    // Cooks register with just their account details; the onboarding wizard
+    // collects the business name, city and area at step 2. Admin-created
+    // cooks still pass them, and they are saved when present.
+    const isAdminCreated = Boolean(req.user && req.user.role === "admin");
+    if (userRole === "cook" && isAdminCreated &&
+        (!kitchen_name || !city || !area)) {
       return res.status(400).json({
         success: false,
         message: "Kitchen name, city and area are required for cook registration",
@@ -103,9 +122,9 @@ const register = async (req, res) => {
     if (userRole === "cook") {
       await cookProfileModel.createProfile({
         user_id: userId,
-        kitchen_name,
-        city,
-        area,
+        kitchen_name: kitchen_name || null,
+        city: city || null,
+        area: area || null,
         bio: bio || null,
       });
     } else if (userRole === "rider") {
@@ -213,6 +232,105 @@ const me = async (req, res) => {
   }
 };
 
+// ---------------------- SOCIAL SIGN-IN ----------------------
+//
+// One endpoint for Google, Apple and Facebook. The app hands over the token
+// it got from the provider and the server asks that provider who it belongs
+// to — a client can claim any email it likes, so nothing it sends is trusted.
+//
+// Only customers sign in this way: cooks and riders are vetted accounts that
+// the admin approves, and a social button would let anyone create one.
+const socialSignIn = async (req, res) => {
+  try {
+    const provider = `${req.body.provider ?? ""}`.trim().toLowerCase();
+    const token = req.body.token ?? req.body.id_token ?? req.body.access_token;
+
+    const identity = await socialAuthHelper.verifySocialToken(
+      provider,
+      token,
+      `${req.body.name ?? ""}`.trim() || null
+    );
+
+    // Same person signing in again.
+    let user = await userModel.findUserByProvider(
+      provider,
+      identity.provider_user_id
+    );
+
+    // Or someone who already has an account under this email — link the two
+    // rather than creating a second account they cannot reach.
+    if (!user && identity.email) {
+      user = await userModel.findUserByPhoneOrEmail(null, identity.email);
+      if (user) {
+        await userModel.updateUser(user[COLUMNS.ID], {
+          [COLUMNS.AUTH_PROVIDER]: provider,
+          [COLUMNS.PROVIDER_USER_ID]: identity.provider_user_id,
+        });
+        user = await userModel.getUserById(user[COLUMNS.ID]);
+      }
+    }
+
+    let isNew = false;
+    if (!user) {
+      if (!identity.email) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "That account has no email address we can use. Sign up with your phone number instead.",
+        });
+      }
+      const userId = await userModel.createUser({
+        [COLUMNS.NAME]: identity.name || identity.email.split("@")[0],
+        [COLUMNS.EMAIL]: identity.email,
+        // Social accounts have no phone until the customer adds one, and no
+        // password at all — they sign in through the provider every time.
+        [COLUMNS.PHONE]: null,
+        [COLUMNS.PASSWORD]: null,
+        [COLUMNS.ROLE]: "customer",
+        [COLUMNS.STATUS]: "active",
+        [COLUMNS.AUTH_PROVIDER]: provider,
+        [COLUMNS.PROVIDER_USER_ID]: identity.provider_user_id,
+      });
+      user = await userModel.getUserById(userId);
+      isNew = true;
+    }
+
+    if (user[COLUMNS.STATUS] === "blocked") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account has been blocked. Please contact support.",
+      });
+    }
+
+    res.status(isNew ? 201 : 200).json({
+      success: true,
+      data: await withProfile(user),
+      token: authHelper.generateToken(user),
+      is_new: isNew,
+    });
+  } catch (error) {
+    if (error instanceof socialAuthHelper.SocialAuthError) {
+      return res
+        .status(error.status)
+        .json({ success: false, message: error.message });
+    }
+    console.error("Error with social sign-in:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.sqlMessage || error?.message || "Internal server error",
+    });
+  }
+};
+
+/// Which buttons the app should show — a provider without server credentials
+/// would only fail when tapped.
+const getAuthProviders = async (req, res) => {
+  res.status(200).json({
+    success: true,
+    data: { providers: socialAuthHelper.availableProviders() },
+  });
+};
+
 // ---------------------- LOGOUT ----------------------
 const logout = async (req, res) => {
   try {
@@ -287,4 +405,12 @@ const uploadDocuments = async (req, res) => {
   }
 };
 
-module.exports = { register, login, me, logout, uploadDocuments };
+module.exports = {
+  register,
+  login,
+  socialSignIn,
+  getAuthProviders,
+  me,
+  logout,
+  uploadDocuments,
+};

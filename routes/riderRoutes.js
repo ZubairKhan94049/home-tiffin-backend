@@ -88,4 +88,20 @@ router.post(
   riderController.uploadDocuments
 );
 
+/**
+ * @route   GET /api/v1/rider/deposit-account
+ * @desc    The platform account the rider banks collected cash into, plus
+ *          their current cash in hand and the weekly deadline
+ * @access  Rider only
+ */
+router.get("/deposit-account", riderController.getDepositAccount);
+
+/**
+ * @route   POST /api/v1/rider/safety/accept
+ * @desc    Record that the rider has read the safety guidelines — one of the
+ *          five sections required before they may go online
+ * @access  Rider only
+ */
+router.post("/safety/accept", riderController.acceptSafetyGuidelines);
+
 module.exports = router;

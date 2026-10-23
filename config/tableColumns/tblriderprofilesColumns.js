@@ -7,6 +7,14 @@ const RIDER_PROFILES = {
   VEHICLE_MODEL: "vehicle_model", // Optional vehicle model
   LICENSE_PLATE: "license_plate", // Vehicle registration plate
   CNIC_NUMBER: "cnic_number", // CNIC number
+  ADDRESS_LINE: "address_line", // Street address as printed on the CNIC
+  ADDRESS_AREA: "address_area", // Area / sector
+  ADDRESS_CITY: "address_city", // City on the CNIC
+  EMERGENCY_NAME: "emergency_name", // Emergency contact full name
+  EMERGENCY_RELATIONSHIP: "emergency_relationship", // Relationship to rider
+  EMERGENCY_PHONE: "emergency_phone", // Emergency contact phone
+  EMERGENCY_ALT_PHONE: "emergency_alt_phone", // Optional second number
+  SAFETY_ACCEPTED_AT: "safety_accepted_at", // When safety guidelines were read
   CNIC_FRONT: "cnic_front", // Path to CNIC front image
   CNIC_BACK: "cnic_back", // Path to CNIC back image
   LICENSE_PHOTO: "license_photo", // Path to driving license image
