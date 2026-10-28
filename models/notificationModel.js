@@ -22,9 +22,9 @@ const markAllRead = async (userId) => {
   return result;
 };
 
-// Create a notification (fire and forget from controllers)
-const createNotification = async ({ user_id, title, body, type = "order" }) => {
-  const [result] = await pool.query(
+// Create a notification; transactional callers pass their connection.
+const createNotification = async ({ user_id, title, body, type = "order" }, executor = pool) => {
+  const [result] = await executor.query(
     `INSERT INTO ${TABLES.NOTIFICATIONS}
       (${COLUMNS.USER_ID}, ${COLUMNS.TITLE}, ${COLUMNS.BODY}, ${COLUMNS.TYPE})
      VALUES (?, ?, ?, ?)`,

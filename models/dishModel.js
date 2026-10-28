@@ -250,7 +250,8 @@ const listVisibleByCategory = async (categoryId) => {
   const [rows] = await pool.query(
     `SELECT d.*, u.${USERS.NAME} AS cook_name,
             cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name,
-            cp.${COOK_PROFILES.RATING} AS cook_rating
+            cp.${COOK_PROFILES.RATING} AS cook_rating,
+            cp.${COOK_PROFILES.IS_KITCHEN_OPEN} AS is_kitchen_open
        FROM ${TABLES.DISHES} d
        JOIN ${TABLES.USERS} u ON u.${USERS.ID} = d.${COLUMNS.COOK_ID}
        JOIN ${TABLES.COOK_PROFILES} cp ON cp.${COOK_PROFILES.USER_ID} = u.${USERS.ID}
@@ -267,7 +268,8 @@ const getVisibleById = async (id) => {
   const [rows] = await pool.query(
     `SELECT d.*, u.${USERS.NAME} AS cook_name,
             cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name,
-            cp.${COOK_PROFILES.RATING} AS cook_rating
+            cp.${COOK_PROFILES.RATING} AS cook_rating,
+            cp.${COOK_PROFILES.IS_KITCHEN_OPEN} AS is_kitchen_open
        FROM ${TABLES.DISHES} d
        JOIN ${TABLES.USERS} u ON u.${USERS.ID} = d.${COLUMNS.COOK_ID}
        JOIN ${TABLES.COOK_PROFILES} cp ON cp.${COOK_PROFILES.USER_ID} = u.${USERS.ID}

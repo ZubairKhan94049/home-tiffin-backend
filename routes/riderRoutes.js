@@ -24,11 +24,17 @@ router.post("/status/toggle", riderController.toggleStatus);
 router.get("/orders/available", riderController.getAvailableOrders);
 
 /**
- * @route   GET /api/v1/rider/orders?status=ongoing|completed
+ * @route   GET /api/v1/rider/orders?status=ongoing|completed|cancelled
  * @desc    My deliveries grouped by tab
  * @access  Rider only
  */
 router.get("/orders", riderController.getOrders);
+/**
+ * @route   GET /api/v1/rider/orders/:id
+ * @desc    My assigned delivery, including cancelled/completed status and items
+ * @access  Rider only (own assignment)
+ */
+router.get("/orders/:id", riderController.getOrderById);
 
 /**
  * @route   POST /api/v1/rider/orders/:id/accept

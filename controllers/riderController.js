@@ -164,21 +164,6 @@ const deliverOrder = async (req, res) => {
 
     const order = await orderModel.getById(id);
 
-    // COD: order total adds to rider cash in hand
-    if (order[ORDERS.PAYMENT_METHOD] === "cod") {
-      await riderProfileModel.incrementCashInHand(
-        req.user.id,
-        order[ORDERS.TOTAL]
-      );
-    }
-
-    await notificationModel.createNotification({
-      user_id: order[ORDERS.CUSTOMER_ID],
-      title: `Order #${order[ORDERS.ORDER_NUMBER]} delivered`,
-      body: "Your order has been delivered. Enjoy your meal!",
-      type: "order",
-    });
-
     res.status(200).json({ success: true, data: order });
   } catch (error) {
     console.error("Error delivering order:", error);
@@ -381,7 +366,21 @@ const acceptSafetyGuidelines = async (req, res) => {
   }
 };
 
-module.exports = {
+const getOrderById = async (req, res) => {
+  try {
+    const order = await orderModel.getById(req.params.id);
+    if (!order || Number(order.rider_id) !== Number(req.user.id)) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    order.items = await orderModel.getItems(req.params.id);
+    return res.json({ success: true, data: order });
+  } catch (error) {
+    console.error("Error fetching delivery:", error);
+    return res.status(500).json({ success: false, message: "Could not load delivery" });
+  }
+};
+
+module.exports = { getOrderById,
   acceptSafetyGuidelines,
   getDepositAccount,
   toggleStatus,

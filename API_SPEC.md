@@ -64,6 +64,7 @@ Auth: `Authorization: Bearer <token>`. Role-guarded groups.
 - `GET|POST /addresses` · `PUT|DELETE /addresses/{id}` · `POST /addresses/{id}/default`
 - `POST /orders` — { cook_id, items: [{dish_id, quantity}], address_id, special_instructions? } → totals computed server-side (delivery fee + tax 5% + discount Rs.100 over Rs.1000, mirroring app math) → status `new`
 - `GET /orders` (mine, newest first) · `GET /orders/{id}` (with items + timeline timestamps)
+- `POST /orders/{id}/cancel` — authenticated customer, own order only; empty body. Allowed in `new`, legacy `accepted`, `preparing`, or `ready` (including rider-assigned), provided `picked_up_at` is null. Atomically sets `cancelled`, `cancelled_by=customer`, `cancelled_at` and persists notifications for customer, cook and assigned rider. Keeps the assigned rider for history. Returns `200 {success:true,data:order+items,message}`; retrying a customer-cancelled order succeeds without duplicate notifications. Foreign order → 404; wrong role → 403; invalid ID → 400. Pickup/terminal conflict → `409 {success:false,message,data:currentOrder+items}`. Cancellation and pickup lock the same order row, so only one can succeed. On timeout/5xx clients must GET the order to reconcile before offering another cancellation attempt. No fee, refund or required cancellation reason has been introduced.
 - `POST /orders/{id}/rate` — { stars, comment? } only when delivered & unrated; updates cook rating cache
 - `GET /notifications` · `POST /notifications/read-all`
 
@@ -107,8 +108,9 @@ Auth: `Authorization: Bearer <token>`. Role-guarded groups.
 ### Rider (role rider, active)
 - `POST /rider/status/toggle` — online/offline
 - `GET /rider/orders/available` — status ready, no rider (admin may also assign directly)
-- `GET /rider/orders?status=ongoing|completed`
-- `POST /rider/orders/{id}/accept` — self-assign → on_the_way after `/pickup`; `/pickup` sets picked_up_at; `/deliver` → delivered, cash_in_hand += total
+- `GET /rider/orders?status=ongoing|completed|cancelled` — ongoing = assigned `ready`/`on_the_way`, completed = `delivered` only; cancelled assignments remain separate and never count as delivered work
+- `GET /rider/orders/{id}` — assigned rider only, including cancelled/completed orders; returns items and kitchen pickup area/city. Foreign/unassigned order → 404.
+- `POST /rider/orders/{id}/accept` — self-assign → on_the_way after `/pickup`; `/pickup` sets picked_up_at; `/deliver` → delivered, cash_in_hand += total. Delivery status, COD cash and customer notification commit in one transaction; retrying an already delivered order assigned to the same rider returns success without collecting COD again.
 - `GET /rider/earnings` — daily/weekly/monthly deliveries + fees, cash_in_hand, settlement history
 - `GET|PUT /rider/profile` · `POST /rider/documents` (multipart). GET also returns `completion` = { percent, is_complete, sections[], missing[] }. PUT now accepts `cnic_number`, the CNIC address (`address_line`, `address_area`, `address_city`) and the emergency contact (`emergency_name`, `emergency_relationship`, `emergency_phone`, `emergency_alt_phone`).
 - `POST /rider/safety/accept` — records that the safety guidelines were read
@@ -147,3 +149,23 @@ All passwords `password123` except admin.
 `GOOGLE_MAPS_API_KEY=`, `FCM_SERVER_KEY=`, `SMS_PROVIDER_API_KEY=` (OTP later),
 `JWT_SECRET` (generated). DB: host localhost, user root, password as provided,
 database `home_tiffin`.
+
+
+## Order flow verification
+
+`npm run test:integration` creates a uniquely named temporary database on local MySQL, runs real HTTP/model handoffs, cancellation/pickup races, notification rollback and COD retry tests, then drops only that database. It refuses remote `DB_HOST` values and never runs schema/reset against `DB_NAME`. The local DB user needs permission to create/drop a temporary database. `npm test` discovers the suite without opting into DB access.
+
+The mobile apps use the existing refresh controls and pull-to-refresh to receive updated statuses. Database notifications are persisted; background push, GPS/ETA, refunds and rider timed-offer dispatch are not part of this flow. Self-accept claims an unassigned ready order; admin assignment is already accepted and awaits pickup. `delivered` is also the completed order state; no additional `completed` server transition is required.
+
+
+## Customer website account and checkout endpoints
+
+All endpoints below require a customer bearer token. These additions use the existing schema.
+
+- `GET /auth/profile` and `PUT /auth/profile`: read/update the authenticated customer's `name`, `email`, and `phone`. Keep at least one contact identifier. Email/phone conflicts return 409; role, status, credentials and other fields cannot be changed here. Responses contain a sanitized user.
+- `GET /customer/settings`: returns only `support_phone`, `service_areas`, `delivery_fee`, `tax_pct`, `discount_threshold`, `discount_amount`. Internal commission/payout configuration is excluded.
+- `GET /customer/reviews`: saved reviews joined with `order_number` and `kitchen_name`, newest first.
+- `POST /orders/quote`: `{cook_id,address_id,items:[{dish_id,quantity,variation_id?}],special_instructions?}`. No writes. Validates active customer and cook, an open kitchen, address ownership, available dishes from one cook, valid option IDs, integer quantities 1–99, and instructions up to 255 characters. Reads all prices/settings from the server and returns `{cook_id,kitchen_name,items,item_total,delivery_fee,tax,discount,total,payment_method:'cod',delivery_address,special_instructions}`. Each quoted item includes `variation_id`, `variation_name` and `serves` when applicable.
+- `POST /orders` accepts the same selection plus optional `expected_total`. Placement recomputes canonical prices through the quote validator. A changed expected total returns 409 before any order is written. Legacy mobile submissions without option IDs continue to use the dish base price. Selected options are snapshotted into the existing item's `name` (for example `Biryani (Family)`) and canonical `price`; no mutable catalog price is used to render an old receipt.
+- Order, items and the cook notification commit in one transaction. Public order numbers are serialized with a MySQL named lock. A network/5xx response is uncertain to the caller: reconcile order history before submitting another order.
+- `GET /orders` includes `items`, `review: {stars,comment,created_at} | null`, and `has_review`. `GET /orders/:id` includes the same review fields. Reviews persist across devices. Rate requests accept integer stars 1–5 and comments up to 1,000 characters.

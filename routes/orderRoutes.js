@@ -4,7 +4,10 @@ const orderController = require("../controllers/orderController");
 const authMiddleware = require("../middleware/authMiddleware");
 
 // All order routes require authentication
-router.use(authMiddleware);
+router.use(authMiddleware, require("../middleware/roleMiddleware")("customer"));
+
+// A read-only, authoritative checkout preview using the same pricing as placement.
+router.post("/quote", orderController.quoteOrder);
 
 /**
  * @route   POST /api/v1/orders
@@ -35,5 +38,12 @@ router.get("/:id", orderController.getOrderById);
  * @body    { stars, comment? }
  */
 router.post("/:id/rate", orderController.rateOrder);
+
+/**
+ * @route   POST /api/v1/orders/:id/cancel
+ * @desc    Cancel my order before rider pickup (idempotent; conflict includes current order)
+ * @access  Private (customer, own order)
+ */
+router.post("/:id/cancel", require("../middleware/roleMiddleware")("customer"), orderController.cancelOrder);
 
 module.exports = router;

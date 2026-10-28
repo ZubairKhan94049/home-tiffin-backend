@@ -698,13 +698,6 @@ const cancelOrder = async (req, res) => {
     }
 
     const order = await orderModel.getById(id);
-    await notificationModel.createNotification({
-      user_id: order[ORDERS.CUSTOMER_ID],
-      title: `Order #${order[ORDERS.ORDER_NUMBER]} cancelled`,
-      body: `Your order was cancelled by admin: ${reason}`,
-      type: "order",
-    });
-
     res.status(200).json({ success: true, data: order });
   } catch (error) {
     console.error("Error cancelling order:", error);
