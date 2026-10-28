@@ -5,11 +5,14 @@ const ITEMS = require("../config/tableColumns/tblorderitemsColumns");
 const USERS = require("../config/tableColumns/tblusersColumns");
 const COOK_PROFILES = require("../config/tableColumns/tblcookprofilesColumns");
 
+const notificationModel = require("./notificationModel");
+const RIDERS = require("../config/tableColumns/tblriderprofilesColumns");
+
 const FIRST_ORDER_NUMBER = 1229;
 
 // Next public order number (#1229+)
-const getNextOrderNumber = async () => {
-  const [rows] = await pool.query(
+const getNextOrderNumber = async (connection = pool) => {
+  const [rows] = await connection.query(
     `SELECT COALESCE(MAX(${COLUMNS.ORDER_NUMBER}), ?) + 1 AS next_number FROM ${TABLES.ORDERS}`,
     [FIRST_ORDER_NUMBER - 1]
   );
@@ -19,8 +22,14 @@ const getNextOrderNumber = async () => {
 // Create order + items in a single transaction
 const createOrder = async (orderData, items) => {
   const connection = await pool.getConnection();
+  let numberLock = false;
   try {
+    // Serialize public number allocation across app instances, without a schema change.
+    const [[lock]] = await connection.query("SELECT GET_LOCK('hometiffin:order-number', 5) AS acquired");
+    if (Number(lock.acquired) !== 1) throw Object.assign(new Error('Checkout is busy. Please try again.'), {status:503});
+    numberLock = true;
     await connection.beginTransaction();
+    orderData.order_number = await getNextOrderNumber(connection);
 
     const [result] = await connection.query(
       `INSERT INTO ${TABLES.ORDERS}
@@ -61,12 +70,23 @@ const createOrder = async (orderData, items) => {
       [itemValues]
     );
 
+    // The order and its cook notification either commit together or both roll back.
+    await notificationModel.createNotification({
+      user_id: orderData.cook_id,
+      title: `New Order #${orderData.order_number}`,
+      body: `You have received a new order of Rs. ${orderData.total}`,
+      type: 'order',
+    }, connection);
     await connection.commit();
     return orderId;
   } catch (error) {
     await connection.rollback();
     throw error;
   } finally {
+    if (numberLock) {
+      try { await connection.query("SELECT RELEASE_LOCK('hometiffin:order-number')"); }
+      catch { connection.destroy(); }
+    }
     connection.release();
   }
 };
@@ -77,6 +97,7 @@ const getById = async (id) => {
     `SELECT o.*,
             cu.${USERS.NAME} AS customer_name, cu.${USERS.PHONE} AS customer_phone,
             ck.${USERS.NAME} AS cook_name, cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name,
+            cp.${COOK_PROFILES.AREA} AS kitchen_area, cp.${COOK_PROFILES.CITY} AS kitchen_city,
             rd.${USERS.NAME} AS rider_name, rd.${USERS.PHONE} AS rider_phone
      FROM ${TABLES.ORDERS} o
      JOIN ${TABLES.USERS} cu ON cu.${USERS.ID} = o.${COLUMNS.CUSTOMER_ID}
@@ -98,12 +119,21 @@ const getItems = async (orderId) => {
   return rows;
 };
 
+// Batch hydration avoids one extra item query per order on the web profile/history.
+const getItemsForOrders = async (ids) => {
+  if (!ids.length) return [];
+  const [rows] = await pool.query(`SELECT * FROM ${TABLES.ORDER_ITEMS} WHERE ${ITEMS.ORDER_ID} IN (?) ORDER BY ${ITEMS.ID} ASC`, [ids]);
+  return rows;
+};
+
 // Customer's orders (newest first)
 const listByCustomer = async (customerId) => {
   const [rows] = await pool.query(
-    `SELECT o.*, cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name
+    `SELECT o.*, cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name,
+            rd.${USERS.NAME} AS rider_name, rd.${USERS.PHONE} AS rider_phone
      FROM ${TABLES.ORDERS} o
      LEFT JOIN ${TABLES.COOK_PROFILES} cp ON cp.${COOK_PROFILES.USER_ID} = o.${COLUMNS.COOK_ID}
+     LEFT JOIN ${TABLES.USERS} rd ON rd.${USERS.ID} = o.${COLUMNS.RIDER_ID}
      WHERE o.${COLUMNS.CUSTOMER_ID} = ?
      ORDER BY o.${COLUMNS.PLACED_AT} DESC`,
     [customerId]
@@ -142,11 +172,14 @@ const listByRider = async (riderId, statusGroup) => {
     statusClause = `AND o.${COLUMNS.STATUS} IN ('ready', 'on_the_way')`;
   } else if (statusGroup === "completed") {
     statusClause = `AND o.${COLUMNS.STATUS} = 'delivered'`;
+  } else if (statusGroup === "cancelled") {
+    statusClause = `AND o.${COLUMNS.STATUS} = 'cancelled'`;
   }
 
   const [rows] = await pool.query(
     `SELECT o.*, cu.${USERS.NAME} AS customer_name, cu.${USERS.PHONE} AS customer_phone,
-            ck.${USERS.NAME} AS cook_name, cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name
+            ck.${USERS.NAME} AS cook_name, cp.${COOK_PROFILES.KITCHEN_NAME} AS kitchen_name,
+            cp.${COOK_PROFILES.AREA} AS kitchen_area, cp.${COOK_PROFILES.CITY} AS kitchen_city
      FROM ${TABLES.ORDERS} o
      JOIN ${TABLES.USERS} cu ON cu.${USERS.ID} = o.${COLUMNS.CUSTOMER_ID}
      JOIN ${TABLES.USERS} ck ON ck.${USERS.ID} = o.${COLUMNS.COOK_ID}
@@ -262,24 +295,126 @@ const pickupByRider = async (orderId, riderId) => {
 
 // Rider delivers: on_the_way (assigned to this rider) -> delivered
 const deliverByRider = async (orderId, riderId) => {
-  const [result] = await pool.query(
-    `UPDATE ${TABLES.ORDERS}
-     SET ${COLUMNS.STATUS} = 'delivered', ${COLUMNS.DELIVERED_AT} = NOW()
-     WHERE ${COLUMNS.ID} = ? AND ${COLUMNS.RIDER_ID} = ? AND ${COLUMNS.STATUS} = 'on_the_way'`,
-    [orderId, riderId]
-  );
-  return result;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[order]] = await connection.query(
+      `SELECT * FROM ${TABLES.ORDERS} WHERE ${COLUMNS.ID} = ? AND ${COLUMNS.RIDER_ID} = ? FOR UPDATE`,
+      [orderId, riderId]
+    );
+    // A retried confirmation must never collect COD twice.
+    if (!order || !["on_the_way", "delivered"].includes(order[COLUMNS.STATUS])) {
+      await connection.rollback();
+      return { affectedRows: 0 };
+    }
+    if (order[COLUMNS.STATUS] === "delivered") {
+      await connection.commit();
+      return { affectedRows: 1 };
+    }
+    await connection.query(
+      `UPDATE ${TABLES.ORDERS} SET ${COLUMNS.STATUS} = 'delivered', ${COLUMNS.DELIVERED_AT} = NOW() WHERE ${COLUMNS.ID} = ?`,
+      [orderId]
+    );
+    if (order[COLUMNS.PAYMENT_METHOD] === "cod") {
+      const [cash] = await connection.query(
+        `UPDATE ${TABLES.RIDER_PROFILES} SET ${RIDERS.CASH_IN_HAND} = ${RIDERS.CASH_IN_HAND} + ? WHERE ${RIDERS.USER_ID} = ?`,
+        [order[COLUMNS.TOTAL], riderId]
+      );
+      if (!cash.affectedRows) throw new Error("Rider profile not found");
+    }
+    await notificationModel.createNotification({
+      user_id: order[COLUMNS.CUSTOMER_ID],
+      title: `Order #${order[COLUMNS.ORDER_NUMBER]} delivered`,
+      body: "Your order has been delivered. Enjoy your meal!",
+    }, connection);
+    await connection.commit();
+    return { affectedRows: 1 };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+// Lock the same order row used by pickup/assignment. Exactly one of a
+// cancellation and pickup can win, including requests on different servers.
+const cancelByCustomer = async (orderId, customerId) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[order]] = await connection.query(
+      `SELECT * FROM ${TABLES.ORDERS} WHERE ${COLUMNS.ID} = ? AND ${COLUMNS.CUSTOMER_ID} = ? FOR UPDATE`,
+      [orderId, customerId]
+    );
+    if (!order) {
+      await connection.rollback();
+      return "not_found";
+    }
+    if (order[COLUMNS.STATUS] === "cancelled" && order[COLUMNS.CANCELLED_BY] === "customer") {
+      await connection.commit();
+      return "cancelled";
+    }
+    if (order[COLUMNS.PICKED_UP_AT] || !["new", "accepted", "preparing", "ready"].includes(order[COLUMNS.STATUS])) {
+      await connection.rollback();
+      return "conflict";
+    }
+    await connection.query(
+      `UPDATE ${TABLES.ORDERS} SET ${COLUMNS.STATUS} = 'cancelled', ${COLUMNS.CANCELLED_BY} = 'customer', ${COLUMNS.CANCELLED_AT} = NOW() WHERE ${COLUMNS.ID} = ?`,
+      [orderId]
+    );
+    for (const userId of [order[COLUMNS.CUSTOMER_ID], order[COLUMNS.COOK_ID], order[COLUMNS.RIDER_ID]].filter(Boolean)) {
+      await notificationModel.createNotification({
+        user_id: userId,
+        title: `Order #${order[COLUMNS.ORDER_NUMBER]} cancelled`,
+        body: "Cancelled by the customer. Do not prepare, pick up or deliver this order.",
+      }, connection);
+    }
+    await connection.commit();
+    return "cancelled";
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
 // Admin force-cancels: any non-terminal status -> cancelled
 const cancelByAdmin = async (orderId, reason) => {
-  const [result] = await pool.query(
-    `UPDATE ${TABLES.ORDERS}
-     SET ${COLUMNS.STATUS} = 'cancelled', ${COLUMNS.CANCEL_REASON} = ?, ${COLUMNS.CANCELLED_BY} = 'admin', ${COLUMNS.CANCELLED_AT} = NOW()
-     WHERE ${COLUMNS.ID} = ? AND ${COLUMNS.STATUS} NOT IN ('delivered', 'cancelled')`,
-    [reason, orderId]
-  );
-  return result;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[order]] = await connection.query(
+      `SELECT * FROM ${TABLES.ORDERS} WHERE ${COLUMNS.ID} = ? FOR UPDATE`,
+      [orderId]
+    );
+    if (!order || ["delivered", "cancelled"].includes(order[COLUMNS.STATUS])) {
+      await connection.rollback();
+      return { affectedRows: 0 };
+    }
+    await connection.query(
+      `UPDATE ${TABLES.ORDERS}
+       SET ${COLUMNS.STATUS} = 'cancelled', ${COLUMNS.CANCEL_REASON} = ?,
+           ${COLUMNS.CANCELLED_BY} = 'admin', ${COLUMNS.CANCELLED_AT} = NOW()
+       WHERE ${COLUMNS.ID} = ?`,
+      [reason, orderId]
+    );
+    for (const userId of [order[COLUMNS.CUSTOMER_ID], order[COLUMNS.COOK_ID], order[COLUMNS.RIDER_ID]].filter(Boolean)) {
+      await notificationModel.createNotification({
+        user_id: userId,
+        title: `Order #${order[COLUMNS.ORDER_NUMBER]} cancelled`,
+        body: `Cancelled by admin: ${reason}. Do not prepare, pick up or deliver this order.`,
+      }, connection);
+    }
+    await connection.commit();
+    return { affectedRows: 1 };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
 // -------- Aggregates --------
@@ -475,6 +610,7 @@ module.exports = {
   createOrder,
   getById,
   getItems,
+  getItemsForOrders,
   listByCustomer,
   listByCook,
   listByRider,
@@ -487,6 +623,7 @@ module.exports = {
   pickupByRider,
   deliverByRider,
   cancelByAdmin,
+  cancelByCustomer,
   countsByStatus,
   todayStats,
   recentOrders,

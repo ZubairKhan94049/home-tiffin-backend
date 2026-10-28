@@ -63,6 +63,7 @@ app.use("/api/v1/dishes", require("./routes/dishRoutes"));
 app.use("/api/v1/banners", require("./routes/bannerRoutes"));
 app.use("/api/v1/addresses", require("./routes/addressRoutes"));
 app.use("/api/v1/orders", require("./routes/orderRoutes"));
+app.use("/api/v1/customer", require("./routes/customerRoutes"));
 app.use("/api/v1/cook", require("./routes/cookRoutes"));
 app.use("/api/v1/rider", require("./routes/riderRoutes"));
 app.use("/api/v1/admin", require("./routes/adminRoutes"));

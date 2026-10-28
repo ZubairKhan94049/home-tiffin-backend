@@ -43,6 +43,11 @@ router.get("/providers", authController.getAuthProviders);
  */
 router.get("/me", authMiddleware, authController.me);
 
+const customerController = require("../controllers/customerController");
+const customerOnly = require("../middleware/roleMiddleware")("customer");
+router.get("/profile", authMiddleware, customerOnly, customerController.getProfile);
+router.put("/profile", authMiddleware, customerOnly, customerController.updateProfile);
+
 /**
  * @route   POST /api/v1/auth/logout
  * @desc    Logout (stateless - client discards token)
